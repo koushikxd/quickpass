@@ -1,3 +1,3 @@
-module github.com/koushik/qpass
+module github.com/koushikyemula/qpass
 
 go 1.21
