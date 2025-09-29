@@ -1,58 +1,133 @@
 package main
 
 import (
-	"crypto/rand"
+	"context"
 	"flag"
 	"fmt"
 	"log"
-	"math/big"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/sashabaranov/go-openai"
 )
 
-const defaultLength = 10
-const defaultCharset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/"
+const defaultLength = 24
 
 func main() {
 	length := flag.Int("n", defaultLength, "Password length")
 	hide := flag.Bool("h", false, "Hide password output in terminal")
 	flag.Parse()
 
-	charset := defaultCharset
-
-	password, err := generatePassword(*length, charset)
+	err := godotenv.Load(".env.local")
 	if err != nil {
-		log.Fatalf("Error generating password: %v", err)
+		log.Printf("Warning: Could not load .env.local file: %v", err)
+	}
+
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		log.Fatalf("OPENAI_API_KEY environment variable is required")
+	}
+
+	fmt.Println("Asking AI for help...")
+	
+	password, err := generateAIPassword(*length, apiKey)
+	if err != nil {
+		log.Fatalf("Error generating AI-powered password: %v", err)
 	}
 
 	err = copyToClipboard(password)
 	if err != nil {
 		log.Printf("Warning: Could not copy to clipboard: %v", err)
-	} 
+	}
 
 	if !*hide {
 		fmt.Println(password)
+		fmt.Println("Don't show this to anyone else")
+	} else {
+		fmt.Println("Password copied to clipboard")
 	}
 }
 
-func generatePassword(length int, charset string) (string, error) {
+func generateAIPassword(length int, apiKey string) (string, error) {
 	if length <= 0 {
 		return "", fmt.Errorf("password length must be positive")
 	}
 
-	password := make([]byte, length)
-	charsetLen := big.NewInt(int64(len(charset)))
+	client := openai.NewClient(apiKey)
 
-	for i := 0; i < length; i++ {
-		randomIndex, err := rand.Int(rand.Reader, charsetLen)
-		if err != nil {
-			return "", fmt.Errorf("failed to generate random number: %v", err)
+	prompt := fmt.Sprintf(`You are an expert password generator. Please generate exactly ONE secure password that is EXACTLY %d characters long. 
+
+Requirements:
+- Must be exactly %d characters
+- Include uppercase letters, lowercase letters, numbers, and special characters
+- Be cryptographically secure and random
+- Do NOT include any explanations, quotes, or additional text
+- Respond ONLY with the password itself
+
+Generate the password now:`, length, length)
+
+	done := make(chan bool)
+	var resp openai.ChatCompletionResponse
+	var err error
+
+	go func() {
+		resp, err = client.CreateChatCompletion(
+			context.Background(),
+			openai.ChatCompletionRequest{
+				Model: "gpt-4o-mini",
+				Messages: []openai.ChatCompletionMessage{
+					{
+						Role:    openai.ChatMessageRoleUser,
+						Content: prompt,
+					},
+				},
+				MaxTokens:   100,
+				Temperature: 1.0,
+			},
+		)
+		done <- true
+	}()
+
+	dots := ""
+	for {
+		select {
+		case <-done:
+			fmt.Print("\n")
+			goto finished
+		case <-time.After(500 * time.Millisecond):
+			dots += "."
+			if len(dots) > 3 {
+				dots = ""
+			} else {
+				fmt.Print(".")
+			}
 		}
-		password[i] = charset[randomIndex.Int64()]
 	}
 
-	return string(password), nil
+finished:
+	if err != nil {
+		return "", fmt.Errorf("failed to generate AI password: %v", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from AI")
+	}
+
+	password := strings.TrimSpace(resp.Choices[0].Message.Content)
+	
+	if len(password) > length {
+		password = password[:length]
+	} else if len(password) < length {
+		for len(password) < length {
+			password += "!"
+		}
+	}
+
+	return password, nil
 }
 
 func copyToClipboard(text string) error {
